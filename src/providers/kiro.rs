@@ -1,14 +1,81 @@
-use super::traits::{
-    ChatMessage, ChatRequest, ChatResponse, Provider, StreamChunk, StreamError, StreamOptions,
-    StreamResult,
-};
-use crate::tools::ToolSpec;
+use super::traits::{ChatMessage, Provider};
 use async_trait::async_trait;
 use anyhow::{Context, Result};
-use futures_util::stream;
 use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
+
+/// Strip ANSI escape codes and terminal artifacts from kiro-cli output.
+fn strip_ansi_and_artifacts(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                while let Some(&nc) = chars.peek() {
+                    chars.next();
+                    if nc.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+        } else {
+            result.push(c);
+        }
+    }
+
+    let cleaned: String = result
+        .lines()
+        .map(|line| {
+            let l = line.strip_prefix("> ").unwrap_or(line);
+            l.strip_suffix("mm")
+                .unwrap_or_else(|| l.strip_suffix('m').unwrap_or(l))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Convert markdown images to ZeroClaw [IMAGE:path] markers
+    convert_md_images(&cleaned.trim().to_string())
+}
+
+/// Convert `![alt](file:///path)` and `![alt](/path)` to `[IMAGE:/path]`
+/// so channels with attachment support (e.g. Telegram) can send the file.
+/// For channels without attachment support (e.g. Feishu text-only send),
+/// the marker is still cleaner than raw markdown image syntax.
+fn convert_md_images(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut remaining = s;
+
+    while let Some(start) = remaining.find("![") {
+        result.push_str(&remaining[..start]);
+        remaining = &remaining[start..];
+
+        if let Some(paren_start) = remaining.find("](") {
+            if let Some(paren_end) = remaining[paren_start + 2..].find(')') {
+                let alt_text = &remaining[2..paren_start];
+                let url = &remaining[paren_start + 2..paren_start + 2 + paren_end];
+                let path = url.strip_prefix("file://").unwrap_or(url);
+
+                if path.starts_with('/') {
+                    result.push_str(&format!("[IMAGE:{path}]"));
+                } else if !alt_text.is_empty() {
+                    result.push_str(&format!("[IMAGE:{url}]"));
+                } else {
+                    result.push_str(&remaining[..paren_start + 2 + paren_end + 1]);
+                }
+                remaining = &remaining[paren_start + 2 + paren_end + 1..];
+                continue;
+            }
+        }
+
+        result.push_str(&remaining[..2]);
+        remaining = &remaining[2..];
+    }
+
+    result.push_str(remaining);
+    result
+}
 
 pub struct KiroProvider {
     kiro_path: String,
@@ -19,9 +86,14 @@ pub struct KiroProvider {
 impl KiroProvider {
     pub fn new(kiro_path: Option<&str>, model: Option<&str>) -> Self {
         let agent = std::env::var("KIRO_AGENT").ok();
-        
+        let resolved_path = kiro_path
+            .map(ToString::to_string)
+            .or_else(|| std::env::var("KIRO_CLI_PATH").ok())
+            .or_else(|| which::which("kiro-cli").ok().map(|p| p.to_string_lossy().to_string()))
+            .unwrap_or_else(|| "kiro-cli".to_string());
+
         Self {
-            kiro_path: kiro_path.unwrap_or("kiro-cli").to_string(),
+            kiro_path: resolved_path,
             agent,
             model: model.map(ToString::to_string),
         }
@@ -42,7 +114,9 @@ impl KiroProvider {
         }
         
         cmd.stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::null())
+            .env("NO_COLOR", "1")
+            .env("TERM", "dumb");
 
         let output = cmd
             .output()
@@ -53,7 +127,8 @@ impl KiroProvider {
             anyhow::bail!("kiro-cli exited with status: {}", output.status);
         }
 
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        let raw = String::from_utf8_lossy(&output.stdout);
+        Ok(strip_ansi_and_artifacts(&raw))
     }
 
     fn messages_to_prompt(&self, messages: &[ChatMessage]) -> String {

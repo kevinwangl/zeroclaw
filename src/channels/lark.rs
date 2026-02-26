@@ -14,6 +14,19 @@ const FEISHU_WS_BASE_URL: &str = "https://open.feishu.cn";
 const LARK_BASE_URL: &str = "https://open.larksuite.com/open-apis";
 const LARK_WS_BASE_URL: &str = "https://open.larksuite.com";
 
+/// Extract the first `[IMAGE:/path/to/file]` marker from text.
+fn extract_image_marker(text: &str) -> Option<String> {
+    let start = text.find("[IMAGE:")?;
+    let rest = &text[start + 7..];
+    let end = rest.find(']')?;
+    let path = &rest[..end];
+    if path.starts_with('/') && std::path::Path::new(path).exists() {
+        Some(path.to_string())
+    } else {
+        None
+    }
+}
+
 const LARK_ACK_REACTIONS_ZH_CN: &[&str] = &[
     "OK", "JIAYI", "APPLAUSE", "THUMBSUP", "MUSCLE", "SMILE", "DONE",
 ];
@@ -971,6 +984,39 @@ impl LarkChannel {
         }
     }
 
+    /// Upload a local image file to Feishu/Lark and return the image_key.
+    async fn upload_image(&self, token: &str, path: &str) -> anyhow::Result<String> {
+        let url = format!("{}/im/v1/images", self.api_base());
+        let file_bytes = tokio::fs::read(path).await?;
+        let filename = std::path::Path::new(path)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+
+        let part = reqwest::multipart::Part::bytes(file_bytes)
+            .file_name(filename)
+            .mime_str("image/png")?;
+        let form = reqwest::multipart::Form::new()
+            .text("image_type", "message")
+            .part("image", part);
+
+        let resp = self
+            .http_client()
+            .post(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .multipart(form)
+            .send()
+            .await?;
+
+        let body: serde_json::Value = resp.json().await?;
+        tracing::info!("Lark upload_image response: {body}");
+        body["data"]["image_key"]
+            .as_str()
+            .map(ToString::to_string)
+            .ok_or_else(|| anyhow::anyhow!("Lark: upload_image missing image_key: {body}"))
+    }
+
     async fn send_text_once(
         &self,
         url: &str,
@@ -1129,6 +1175,45 @@ impl Channel for LarkChannel {
         let token = self.get_tenant_access_token().await?;
         let url = self.send_message_url();
 
+        // Check for [IMAGE:path] markers and send as image if found
+        if let Some(image_path) = extract_image_marker(&message.content) {
+            tracing::info!("Lark: detected image marker, uploading {image_path}");
+            match self.upload_image(&token, &image_path).await {
+                Ok(image_key) => {
+                    tracing::info!("Lark: image uploaded, key={image_key}");
+                    let text_part = message.content
+                        .replace(&format!("[IMAGE:{image_path}]"), "")
+                        .trim()
+                        .to_string();
+
+                    // Send text part first if non-empty
+                    if !text_part.is_empty() {
+                        let content = serde_json::json!({ "text": text_part }).to_string();
+                        let body = serde_json::json!({
+                            "receive_id": message.recipient,
+                            "msg_type": "text",
+                            "content": content,
+                        });
+                        let _ = self.send_text_once(&url, &token, &body).await;
+                    }
+
+                    // Send image
+                    let content = serde_json::json!({ "image_key": image_key }).to_string();
+                    let body = serde_json::json!({
+                        "receive_id": message.recipient,
+                        "msg_type": "image",
+                        "content": content,
+                    });
+                    let (status, response) = self.send_text_once(&url, &token, &body).await?;
+                    ensure_lark_send_success(status, &response, "image send")?;
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::warn!("Lark: image upload failed: {e}, falling back to text");
+                }
+            }
+        }
+
         let content = serde_json::json!({ "text": message.content }).to_string();
         let body = serde_json::json!({
             "receive_id": message.recipient,
@@ -1139,7 +1224,6 @@ impl Channel for LarkChannel {
         let (status, response) = self.send_text_once(&url, &token, &body).await?;
 
         if should_refresh_lark_tenant_token(status, &response) {
-            // Token expired/invalid, invalidate and retry once.
             self.invalidate_token().await;
             let new_token = self.get_tenant_access_token().await?;
             let (retry_status, retry_response) =
