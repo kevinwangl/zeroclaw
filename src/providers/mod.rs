@@ -21,6 +21,7 @@ pub mod bedrock;
 pub mod compatible;
 pub mod copilot;
 pub mod gemini;
+pub mod kiro;
 pub mod ollama;
 pub mod openai;
 pub mod openai_codex;
@@ -971,6 +972,18 @@ fn create_provider_with_url_and_options(
         "openrouter" => Ok(Box::new(openrouter::OpenRouterProvider::new(key))),
         "anthropic" => Ok(Box::new(anthropic::AnthropicProvider::new(key))),
         "openai" => Ok(Box::new(openai::OpenAiProvider::with_base_url(api_url, key))),
+        
+        // Kiro CLI provider (subprocess-based)
+        "kiro" | "kiro-cli" => {
+            let kiro_path = std::env::var("KIRO_CLI_PATH").ok();
+            let model_env = std::env::var("KIRO_MODEL").ok();
+            let model = api_url.or(model_env.as_deref());
+            Ok(Box::new(kiro::KiroProvider::new(
+                kiro_path.as_deref(),
+                model,
+            )))
+        }
+        
         // Ollama uses api_url for custom base URL (e.g. remote Ollama instance)
         "ollama" => Ok(Box::new(ollama::OllamaProvider::new_with_reasoning(
             api_url,
