@@ -139,7 +139,9 @@ pub async fn prepare_messages_for_provider(
 
     let mut normalized_messages = Vec::with_capacity(messages.len());
     for message in messages {
-        if message.role != "user" {
+        // Skip base64 conversion for non-user messages and tool results
+        // wrapped as user messages (prompt-mode "[Tool results]\n...")
+        if message.role != "user" || message.content.starts_with("[Tool results]") {
             normalized_messages.push(message.clone());
             continue;
         }
@@ -565,5 +567,78 @@ mod tests {
         let payload = extract_ollama_image_payload("data:image/png;base64,abcd==")
             .expect("payload should be extracted");
         assert_eq!(payload, "abcd==");
+    }
+}
+
+#[cfg(test)]
+mod tool_output_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn tool_output_images_keep_local_paths() {
+        let config = MultimodalConfig::default();
+        
+        let messages = vec![
+            ChatMessage {
+                role: "tool".to_string(),
+                content: "Screenshot captured.\n[IMAGE:/tmp/screenshot.png]".to_string(),
+            },
+        ];
+
+        let result = prepare_messages_for_provider(&messages, &config).await;
+        assert!(result.is_ok());
+        
+        let prepared = result.unwrap();
+        let tool_msg = &prepared.messages[0];
+        
+        // Tool message should keep local path, not convert to base64
+        assert!(tool_msg.content.contains("[IMAGE:/tmp/screenshot.png]"));
+        assert!(!tool_msg.content.contains("data:image"));
+        assert!(!tool_msg.content.contains("base64"));
+    }
+
+    #[tokio::test]
+    async fn assistant_messages_keep_local_paths() {
+        let config = MultimodalConfig::default();
+        
+        let messages = vec![
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "Result: [IMAGE:/tmp/result.png]".to_string(),
+            },
+        ];
+
+        let result = prepare_messages_for_provider(&messages, &config).await;
+        assert!(result.is_ok());
+        
+        let prepared = result.unwrap();
+        
+        // Assistant message should keep local path
+        assert!(prepared.messages[0].content.contains("[IMAGE:/tmp/result.png]"));
+        assert!(!prepared.messages[0].content.contains("data:image"));
+    }
+
+    /// Tool results in prompt mode are wrapped as user messages with
+    /// "[Tool results]\n..." prefix. These must NOT be base64-converted.
+    #[tokio::test]
+    async fn prompt_mode_tool_results_wrapped_as_user_keep_local_paths() {
+        let config = MultimodalConfig::default();
+
+        let messages = vec![
+            ChatMessage {
+                role: "user".to_string(),
+                content: "[Tool results]\n<tool_result name=\"screenshot\">\nScreenshot captured successfully (12345 bytes).\n[IMAGE:/tmp/screenshot.png]\n</tool_result>".to_string(),
+            },
+        ];
+
+        let result = prepare_messages_for_provider(&messages, &config).await;
+        assert!(result.is_ok());
+
+        let prepared = result.unwrap();
+        let msg = &prepared.messages[0];
+
+        // Must keep local path, NOT convert to base64
+        assert!(msg.content.contains("[IMAGE:/tmp/screenshot.png]"), "local path should be preserved");
+        assert!(!msg.content.contains("data:image"), "should not contain base64 data URI");
     }
 }

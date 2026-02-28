@@ -2117,8 +2117,15 @@ pub(crate) async fn run_tool_call_loop(
             .into());
         }
 
-        let prepared_messages =
-            multimodal::prepare_messages_for_provider(history, multimodal_config).await?;
+        let prepared_messages = if provider.supports_raw_image_markers() {
+            // Provider handles [IMAGE:path] natively — skip base64 conversion
+            multimodal::PreparedMessages {
+                contains_images: multimodal::contains_image_markers(history),
+                messages: history.to_vec(),
+            }
+        } else {
+            multimodal::prepare_messages_for_provider(history, multimodal_config).await?
+        };
 
         // ── Progress: LLM thinking ────────────────────────────
         if let Some(ref tx) = on_delta {

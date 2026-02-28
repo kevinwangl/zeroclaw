@@ -388,6 +388,12 @@ pub trait Provider: Send + Sync {
         self.capabilities().vision
     }
 
+    /// Whether provider handles image markers natively (e.g. `[IMAGE:/path]`)
+    /// and should NOT have them converted to base64 data URIs.
+    fn supports_raw_image_markers(&self) -> bool {
+        false
+    }
+
     /// Warm up the HTTP connection pool (TLS handshake, DNS, HTTP/2 setup).
     /// Default implementation is a no-op; providers with HTTP clients should override.
     async fn warmup(&self) -> anyhow::Result<()> {

@@ -176,6 +176,53 @@ impl SlackChannel {
             .or_insert_with(|| now_ts.to_string())
             .clone()
     }
+
+    async fn upload_file(
+        &self,
+        file_path: &str,
+        channel: &str,
+        thread_ts: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let path = std::path::Path::new(file_path);
+        if !path.exists() {
+            tracing::warn!("Slack: file not found: {}", file_path);
+            return Ok(());
+        }
+
+        let file_bytes = tokio::fs::read(path).await?;
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file");
+
+        let form = reqwest::multipart::Form::new()
+            .text("channels", channel.to_string())
+            .part(
+                "file",
+                reqwest::multipart::Part::bytes(file_bytes).file_name(filename.to_string()),
+            );
+
+        let mut form = form;
+        if let Some(ts) = thread_ts {
+            form = form.text("thread_ts", ts.to_string());
+        }
+
+        let resp = self
+            .http_client()
+            .post("https://slack.com/api/files.upload")
+            .bearer_auth(&self.bot_token)
+            .multipart(form)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            tracing::warn!("Slack file upload failed ({status}): {body}");
+        }
+
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -185,9 +232,19 @@ impl Channel for SlackChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+        use super::attachment::{parse_attachment_markers, is_local_path};
+
+        let content = super::strip_tool_call_tags(&message.content);
+        let (text, attachments) = parse_attachment_markers(&content);
+
+        // Send text message
         let mut body = serde_json::json!({
             "channel": message.recipient,
-            "text": message.content
+            "text": if text.is_empty() && !attachments.is_empty() {
+                format!("{} attachment(s)", attachments.len())
+            } else {
+                text
+            }
         });
 
         if let Some(ref ts) = message.thread_ts {
@@ -203,23 +260,43 @@ impl Channel for SlackChannel {
             .await?;
 
         let status = resp.status();
-        let body = resp
+        let body_text = resp
             .text()
             .await
             .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
 
         if !status.is_success() {
-            anyhow::bail!("Slack chat.postMessage failed ({status}): {body}");
+            anyhow::bail!("Slack chat.postMessage failed ({status}): {body_text}");
         }
 
-        // Slack returns 200 for most app-level errors; check JSON "ok" field
-        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+        let parsed: serde_json::Value = serde_json::from_str(&body_text).unwrap_or_default();
         if parsed.get("ok") == Some(&serde_json::Value::Bool(false)) {
             let err = parsed
                 .get("error")
                 .and_then(|e| e.as_str())
                 .unwrap_or("unknown");
             anyhow::bail!("Slack chat.postMessage failed: {err}");
+        }
+
+        // Upload attachments if any
+        for attachment in &attachments {
+            if is_local_path(&attachment.target) {
+                self.upload_file(&attachment.target, &message.recipient, message.thread_ts.as_deref())
+                    .await?;
+            } else {
+                // For URLs, send as text with link
+                let link_msg = format!("{}: {}", attachment.kind.marker_name(), attachment.target);
+                let link_body = serde_json::json!({
+                    "channel": message.recipient,
+                    "text": link_msg
+                });
+                self.http_client()
+                    .post("https://slack.com/api/chat.postMessage")
+                    .bearer_auth(&self.bot_token)
+                    .json(&link_body)
+                    .send()
+                    .await?;
+            }
         }
 
         Ok(())

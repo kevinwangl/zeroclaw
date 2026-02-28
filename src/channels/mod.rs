@@ -14,8 +14,10 @@
 //! To add a new channel, implement [`Channel`] in a new submodule and wire it into
 //! [`start_channels`]. See `AGENTS.md` §7.2 for the full change playbook.
 
+pub mod attachment;
 pub mod clawdtalk;
 pub mod cli;
+mod delivery_instructions_tests;
 pub mod dingtalk;
 pub mod discord;
 pub mod email_channel;
@@ -411,7 +413,16 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Keep normal text outside markers and never wrap markers in code fences.\n\
              - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
         ),
-        _ => None,
+        // Special channels that don't need delivery instructions
+        "cli" | "dummy" | "ClawdTalk" => None,
+        // Default instructions for all other channels
+        _ => Some(
+            "When responding:\n\
+             - Be concise and direct. Skip filler phrases like 'Great question!' or 'Certainly!'\n\
+             - For media attachments use markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]\n\
+             - Keep normal text outside markers and never wrap markers in code fences\n\
+             - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping",
+        ),
     }
 }
 
@@ -842,6 +853,7 @@ fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
         "token limit exceeded",
         "prompt is too long",
         "input is too long",
+        "context window has overflowed",
     ]
     .iter()
     .any(|hint| lower.contains(hint))

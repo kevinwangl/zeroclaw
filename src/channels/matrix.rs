@@ -529,6 +529,8 @@ impl Channel for MatrixChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+        use super::attachment::{parse_attachment_markers, is_local_path};
+
         let client = self.matrix_client().await?;
         let target_room_id = self.target_room_id().await?;
         let target_room: OwnedRoomId = target_room_id.parse()?;
@@ -547,8 +549,42 @@ impl Channel for MatrixChannel {
             anyhow::bail!("Matrix room '{}' is not in joined state", target_room_id);
         }
 
-        room.send(RoomMessageEventContent::text_markdown(&message.content))
-            .await?;
+        let content = super::strip_tool_call_tags(&message.content);
+        let (text, attachments) = parse_attachment_markers(&content);
+
+        // Send text message if present
+        if !text.is_empty() || attachments.is_empty() {
+            room.send(RoomMessageEventContent::text_markdown(&text))
+                .await?;
+        }
+
+        // Send attachments
+        for attachment in &attachments {
+            if is_local_path(&attachment.target) {
+                let path = std::path::Path::new(&attachment.target);
+                if path.exists() {
+                    let mime = mime_guess::from_path(path).first_or_octet_stream();
+                    let data = tokio::fs::read(path).await?;
+                    
+                    room.send_attachment(
+                        path.file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("file"),
+                        &mime,
+                        data,
+                        Default::default(),
+                    )
+                    .await?;
+                } else {
+                    tracing::warn!("Matrix: file not found: {}", attachment.target);
+                }
+            } else {
+                // For URLs, send as text with link
+                let link_msg = format!("{}: {}", attachment.kind.marker_name(), attachment.target);
+                room.send(RoomMessageEventContent::text_plain(&link_msg))
+                    .await?;
+            }
+        }
 
         Ok(())
     }

@@ -81,6 +81,73 @@ impl MattermostChannel {
             .to_string();
         (id, username)
     }
+
+    async fn upload_file(
+        &self,
+        file_path: &str,
+        channel_id: &str,
+        root_id: Option<&str>,
+    ) -> Result<()> {
+        let path = std::path::Path::new(file_path);
+        if !path.exists() {
+            tracing::warn!("Mattermost: file not found: {}", file_path);
+            return Ok(());
+        }
+
+        let file_bytes = tokio::fs::read(path).await?;
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file");
+
+        let form = reqwest::multipart::Form::new()
+            .text("channel_id", channel_id.to_string())
+            .part(
+                "files",
+                reqwest::multipart::Part::bytes(file_bytes).file_name(filename.to_string()),
+            );
+
+        let resp = self
+            .http_client()
+            .post(format!("{}/api/v4/files", self.base_url))
+            .bearer_auth(&self.bot_token)
+            .multipart(form)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            tracing::warn!("Mattermost file upload failed ({status}): {body}");
+            return Ok(());
+        }
+
+        // Get file_id from response and attach to a post
+        let upload_resp: serde_json::Value = resp.json().await?;
+        if let Some(file_infos) = upload_resp.get("file_infos").and_then(|v| v.as_array()) {
+            if let Some(file_id) = file_infos.first().and_then(|f| f.get("id")).and_then(|id| id.as_str()) {
+                let mut post_body = serde_json::json!({
+                    "channel_id": channel_id,
+                    "message": "",
+                    "file_ids": [file_id]
+                });
+                if let Some(root) = root_id {
+                    post_body.as_object_mut().unwrap().insert(
+                        "root_id".to_string(),
+                        serde_json::Value::String(root.to_string()),
+                    );
+                }
+                self.http_client()
+                    .post(format!("{}/api/v4/posts", self.base_url))
+                    .bearer_auth(&self.bot_token)
+                    .json(&post_body)
+                    .send()
+                    .await?;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -90,41 +157,73 @@ impl Channel for MattermostChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
-        // Mattermost supports threading via 'root_id'.
-        // We pack 'channel_id:root_id' into recipient if it's a thread.
+        use super::attachment::{parse_attachment_markers, is_local_path};
+
+        let content = super::strip_tool_call_tags(&message.content);
+        let (text, attachments) = parse_attachment_markers(&content);
+
         let (channel_id, root_id) = if let Some((c, r)) = message.recipient.split_once(':') {
             (c, Some(r))
         } else {
             (message.recipient.as_str(), None)
         };
 
-        let mut body_map = serde_json::json!({
-            "channel_id": channel_id,
-            "message": message.content
-        });
+        // Send text message if present
+        if !text.is_empty() || attachments.is_empty() {
+            let mut body_map = serde_json::json!({
+                "channel_id": channel_id,
+                "message": if text.is_empty() { format!("{} attachment(s)", attachments.len()) } else { text }
+            });
 
-        if let Some(root) = root_id {
-            body_map.as_object_mut().unwrap().insert(
-                "root_id".to_string(),
-                serde_json::Value::String(root.to_string()),
-            );
+            if let Some(root) = root_id {
+                body_map.as_object_mut().unwrap().insert(
+                    "root_id".to_string(),
+                    serde_json::Value::String(root.to_string()),
+                );
+            }
+
+            let resp = self
+                .http_client()
+                .post(format!("{}/api/v4/posts", self.base_url))
+                .bearer_auth(&self.bot_token)
+                .json(&body_map)
+                .send()
+                .await?;
+
+            let status = resp.status();
+            if !status.is_success() {
+                let body = resp
+                    .text()
+                    .await
+                    .unwrap_or_else(|e| format!("<failed to read response: {e}>"));
+                bail!("Mattermost post failed ({status}): {body}");
+            }
         }
 
-        let resp = self
-            .http_client()
-            .post(format!("{}/api/v4/posts", self.base_url))
-            .bearer_auth(&self.bot_token)
-            .json(&body_map)
-            .send()
-            .await?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp
-                .text()
-                .await
-                .unwrap_or_else(|e| format!("<failed to read response: {e}>"));
-            bail!("Mattermost post failed ({status}): {body}");
+        // Upload attachments
+        for attachment in &attachments {
+            if is_local_path(&attachment.target) {
+                self.upload_file(&attachment.target, channel_id, root_id).await?;
+            } else {
+                // For URLs, send as text with link
+                let link_msg = format!("{}: {}", attachment.kind.marker_name(), attachment.target);
+                let mut link_body = serde_json::json!({
+                    "channel_id": channel_id,
+                    "message": link_msg
+                });
+                if let Some(root) = root_id {
+                    link_body.as_object_mut().unwrap().insert(
+                        "root_id".to_string(),
+                        serde_json::Value::String(root.to_string()),
+                    );
+                }
+                self.http_client()
+                    .post(format!("{}/api/v4/posts", self.base_url))
+                    .bearer_auth(&self.bot_token)
+                    .json(&link_body)
+                    .send()
+                    .await?;
+            }
         }
 
         Ok(())

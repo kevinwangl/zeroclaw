@@ -787,6 +787,43 @@ impl LarkChannel {
                             Some(details) => (details.text, details.mentioned_open_ids),
                             None => continue,
                         },
+                        "image" => {
+                            // Parse image_key from content
+                            let v: serde_json::Value = match serde_json::from_str(&lark_msg.content) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    tracing::error!("Lark WS: failed to parse image content: {e}");
+                                    continue;
+                                }
+                            };
+                            let image_key = match v.get("image_key").and_then(|k| k.as_str()) {
+                                Some(k) => k,
+                                None => {
+                                    tracing::error!("Lark WS: image message missing image_key");
+                                    continue;
+                                }
+                            };
+
+                            // Download image
+                            let token = match self.get_tenant_access_token().await {
+                                Ok(t) => t,
+                                Err(e) => {
+                                    tracing::error!("Lark WS: failed to get token for image download: {e}");
+                                    continue;
+                                }
+                            };
+
+                            let image_path = match self.download_image(&token, image_key).await {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    tracing::error!("Lark WS: failed to download image {image_key}: {e}");
+                                    continue;
+                                }
+                            };
+
+                            tracing::info!("Lark WS: downloaded image to {image_path}");
+                            (format!("[IMAGE:{}]", image_path), Vec::new())
+                        }
                         _ => { tracing::debug!("Lark WS: skipping unsupported type '{}'", lark_msg.message_type); continue; }
                     };
 
@@ -984,19 +1021,70 @@ impl LarkChannel {
         }
     }
 
+    /// Download an image from Feishu/Lark by image_key and save to temp directory.
+    async fn download_image(&self, token: &str, image_key: &str) -> anyhow::Result<String> {
+        let url = format!("{}/im/v1/images/{}", self.api_base(), image_key);
+        
+        let resp = self
+            .http_client()
+            .get(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            anyhow::bail!("Lark: download_image failed: status={}", resp.status());
+        }
+
+        let bytes = resp.bytes().await?;
+        
+        // Save to temp directory
+        let temp_dir = std::env::temp_dir().join("zeroclaw_lark_images");
+        tokio::fs::create_dir_all(&temp_dir).await?;
+        
+        let file_name = format!("{}_{}.jpg", chrono::Utc::now().timestamp(), image_key);
+        let file_path = temp_dir.join(&file_name);
+        
+        tokio::fs::write(&file_path, &bytes).await?;
+        
+        Ok(file_path.to_string_lossy().to_string())
+    }
+
     /// Upload a local image file to Feishu/Lark and return the image_key.
     async fn upload_image(&self, token: &str, path: &str) -> anyhow::Result<String> {
         let url = format!("{}/im/v1/images", self.api_base());
         let file_bytes = tokio::fs::read(path).await?;
-        let filename = std::path::Path::new(path)
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
 
-        let part = reqwest::multipart::Part::bytes(file_bytes)
-            .file_name(filename)
-            .mime_str("image/png")?;
+        // Compress if > 5MB: convert to JPEG with reduced quality
+        const MAX_SIZE: usize = 5 * 1024 * 1024;
+        let (final_bytes, mime, fname) = if file_bytes.len() > MAX_SIZE {
+            tracing::info!("Lark: image {}MB > 5MB, compressing to JPEG", file_bytes.len() / 1024 / 1024);
+            let compressed = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
+                let img = image::load_from_memory(&file_bytes)?;
+                // Scale down if very large
+                let img = if img.width() > 2048 || img.height() > 2048 {
+                    img.resize(2048, 2048, image::imageops::FilterType::Lanczos3)
+                } else {
+                    img
+                };
+                let mut buf = std::io::Cursor::new(Vec::new());
+                img.write_to(&mut buf, image::ImageFormat::Jpeg)?;
+                Ok(buf.into_inner())
+            }).await??;
+            tracing::info!("Lark: compressed to {}KB", compressed.len() / 1024);
+            (compressed, "image/jpeg", "image.jpg".to_string())
+        } else {
+            let f = std::path::Path::new(path)
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            (file_bytes, "image/png", f)
+        };
+
+        let part = reqwest::multipart::Part::bytes(final_bytes)
+            .file_name(fname)
+            .mime_str(mime)?;
         let form = reqwest::multipart::Form::new()
             .text("image_type", "message")
             .part("image", part);
@@ -1015,6 +1103,43 @@ impl LarkChannel {
             .as_str()
             .map(ToString::to_string)
             .ok_or_else(|| anyhow::anyhow!("Lark: upload_image missing image_key: {body}"))
+    }
+
+    async fn upload_file(&self, token: &str, path: &str) -> anyhow::Result<String> {
+        let url = format!("{}/im/v1/files", self.api_base());
+        let file_path = std::path::Path::new(path);
+        
+        if !file_path.exists() {
+            anyhow::bail!("Lark: file not found: {}", path);
+        }
+
+        let file_bytes = tokio::fs::read(path).await?;
+        let filename = file_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file");
+
+        let part = reqwest::multipart::Part::bytes(file_bytes)
+            .file_name(filename.to_string());
+        
+        let form = reqwest::multipart::Form::new()
+            .text("file_type", "stream")
+            .part("file", part);
+
+        let resp = self
+            .http_client()
+            .post(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .multipart(form)
+            .send()
+            .await?;
+
+        let body: serde_json::Value = resp.json().await?;
+        tracing::info!("Lark upload_file response: {body}");
+        body["data"]["file_key"]
+            .as_str()
+            .map(ToString::to_string)
+            .ok_or_else(|| anyhow::anyhow!("Lark: upload_file missing file_key: {body}"))
     }
 
     async fn send_text_once(
@@ -1172,74 +1297,98 @@ impl Channel for LarkChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+        use super::attachment::{parse_attachment_markers, is_local_path, AttachmentKind};
+
         let token = self.get_tenant_access_token().await?;
         let url = self.send_message_url();
 
-        // Check for [IMAGE:path] markers and send as image if found
-        if let Some(image_path) = extract_image_marker(&message.content) {
-            tracing::info!("Lark: detected image marker, uploading {image_path}");
-            match self.upload_image(&token, &image_path).await {
-                Ok(image_key) => {
-                    tracing::info!("Lark: image uploaded, key={image_key}");
-                    let text_part = message.content
-                        .replace(&format!("[IMAGE:{image_path}]"), "")
-                        .trim()
-                        .to_string();
+        let content = super::strip_tool_call_tags(&message.content);
+        let (text, attachments) = parse_attachment_markers(&content);
 
-                    // Send text part first if non-empty
-                    if !text_part.is_empty() {
-                        let content = serde_json::json!({ "text": text_part }).to_string();
-                        let body = serde_json::json!({
-                            "receive_id": message.recipient,
-                            "msg_type": "text",
-                            "content": content,
-                        });
-                        let _ = self.send_text_once(&url, &token, &body).await;
+        // Send text message if present
+        if !text.is_empty() || attachments.is_empty() {
+            let text_content = serde_json::json!({ "text": text }).to_string();
+            let body = serde_json::json!({
+                "receive_id": message.recipient,
+                "msg_type": "text",
+                "content": text_content,
+            });
+
+            let (status, response) = self.send_text_once(&url, &token, &body).await?;
+
+            if should_refresh_lark_tenant_token(status, &response) {
+                self.invalidate_token().await;
+                let new_token = self.get_tenant_access_token().await?;
+                let (retry_status, retry_response) =
+                    self.send_text_once(&url, &new_token, &body).await?;
+
+                if should_refresh_lark_tenant_token(retry_status, &retry_response) {
+                    anyhow::bail!(
+                        "Lark send failed after token refresh: status={retry_status}, body={retry_response}"
+                    );
+                }
+
+                ensure_lark_send_success(retry_status, &retry_response, "after token refresh")?;
+            } else {
+                ensure_lark_send_success(status, &response, "text send")?;
+            }
+        }
+
+        // Send attachments
+        for attachment in &attachments {
+            if !is_local_path(&attachment.target) {
+                // For URLs, send as text link
+                let link_content = serde_json::json!({ 
+                    "text": format!("{}: {}", attachment.kind.marker_name(), attachment.target) 
+                }).to_string();
+                let link_body = serde_json::json!({
+                    "receive_id": message.recipient,
+                    "msg_type": "text",
+                    "content": link_content,
+                });
+                let _ = self.send_text_once(&url, &token, &link_body).await;
+                continue;
+            }
+
+            // Handle local files
+            match attachment.kind {
+                AttachmentKind::Image => {
+                    match self.upload_image(&token, &attachment.target).await {
+                        Ok(image_key) => {
+                            let img_content = serde_json::json!({ "image_key": image_key }).to_string();
+                            let img_body = serde_json::json!({
+                                "receive_id": message.recipient,
+                                "msg_type": "image",
+                                "content": img_content,
+                            });
+                            let (status, response) = self.send_text_once(&url, &token, &img_body).await?;
+                            ensure_lark_send_success(status, &response, "image send")?;
+                        }
+                        Err(e) => {
+                            tracing::warn!("Lark: image upload failed: {e}");
+                        }
                     }
-
-                    // Send image
-                    let content = serde_json::json!({ "image_key": image_key }).to_string();
-                    let body = serde_json::json!({
-                        "receive_id": message.recipient,
-                        "msg_type": "image",
-                        "content": content,
-                    });
-                    let (status, response) = self.send_text_once(&url, &token, &body).await?;
-                    ensure_lark_send_success(status, &response, "image send")?;
-                    return Ok(());
                 }
-                Err(e) => {
-                    tracing::warn!("Lark: image upload failed: {e}, falling back to text");
+                AttachmentKind::Document | AttachmentKind::Video | AttachmentKind::Audio | AttachmentKind::Voice => {
+                    match self.upload_file(&token, &attachment.target).await {
+                        Ok(file_key) => {
+                            let file_content = serde_json::json!({ "file_key": file_key }).to_string();
+                            let file_body = serde_json::json!({
+                                "receive_id": message.recipient,
+                                "msg_type": "file",
+                                "content": file_content,
+                            });
+                            let (status, response) = self.send_text_once(&url, &token, &file_body).await?;
+                            ensure_lark_send_success(status, &response, "file send")?;
+                        }
+                        Err(e) => {
+                            tracing::warn!("Lark: file upload failed: {e}");
+                        }
+                    }
                 }
             }
         }
 
-        let content = serde_json::json!({ "text": message.content }).to_string();
-        let body = serde_json::json!({
-            "receive_id": message.recipient,
-            "msg_type": "text",
-            "content": content,
-        });
-
-        let (status, response) = self.send_text_once(&url, &token, &body).await?;
-
-        if should_refresh_lark_tenant_token(status, &response) {
-            self.invalidate_token().await;
-            let new_token = self.get_tenant_access_token().await?;
-            let (retry_status, retry_response) =
-                self.send_text_once(&url, &new_token, &body).await?;
-
-            if should_refresh_lark_tenant_token(retry_status, &retry_response) {
-                anyhow::bail!(
-                    "Lark send failed after token refresh: status={retry_status}, body={retry_response}"
-                );
-            }
-
-            ensure_lark_send_success(retry_status, &retry_response, "after token refresh")?;
-            return Ok(());
-        }
-
-        ensure_lark_send_success(status, &response, "without token refresh")?;
         Ok(())
     }
 

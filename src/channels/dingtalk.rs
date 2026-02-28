@@ -112,6 +112,11 @@ impl Channel for DingTalkChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+        use super::attachment::{parse_attachment_markers, is_local_path};
+
+        let content = super::strip_tool_call_tags(&message.content);
+        let (text, attachments) = parse_attachment_markers(&content);
+
         let webhooks = self.session_webhooks.read().await;
         let webhook_url = webhooks.get(&message.recipient).ok_or_else(|| {
             anyhow::anyhow!(
@@ -121,26 +126,60 @@ impl Channel for DingTalkChannel {
             )
         })?;
 
-        let title = message.subject.as_deref().unwrap_or("ZeroClaw");
-        let body = serde_json::json!({
-            "msgtype": "markdown",
-            "markdown": {
-                "title": title,
-                "text": message.content,
+        // Send text message
+        if !text.is_empty() || attachments.is_empty() {
+            let title = message.subject.as_deref().unwrap_or("ZeroClaw");
+            let body = serde_json::json!({
+                "msgtype": "markdown",
+                "markdown": {
+                    "title": title,
+                    "text": text,
+                }
+            });
+
+            let resp = self
+                .http_client()
+                .post(webhook_url)
+                .json(&body)
+                .send()
+                .await?;
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let err = resp.text().await.unwrap_or_default();
+                anyhow::bail!("DingTalk webhook reply failed ({status}): {err}");
             }
-        });
+        }
 
-        let resp = self
-            .http_client()
-            .post(webhook_url)
-            .json(&body)
-            .send()
-            .await?;
+        // Send attachments as separate messages
+        for attachment in &attachments {
+            let attachment_text = if is_local_path(&attachment.target) {
+                // For local files, send file path info (DingTalk Stream API doesn't support direct file upload via webhook)
+                format!("📎 {}: `{}`\n\n*Note: File upload requires DingTalk Open API integration*", 
+                    attachment.kind.marker_name(), attachment.target)
+            } else {
+                // For URLs, send as markdown link
+                format!("[{}]({})", attachment.kind.marker_name(), attachment.target)
+            };
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("DingTalk webhook reply failed ({status}): {err}");
+            let body = serde_json::json!({
+                "msgtype": "markdown",
+                "markdown": {
+                    "title": "Attachment",
+                    "text": attachment_text,
+                }
+            });
+
+            let resp = self
+                .http_client()
+                .post(webhook_url)
+                .json(&body)
+                .send()
+                .await?;
+
+            if !resp.status().is_success() {
+                tracing::warn!("DingTalk attachment message failed: {}", resp.status());
+            }
         }
 
         Ok(())
